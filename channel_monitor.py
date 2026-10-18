@@ -38,6 +38,23 @@ MONITOR_BOOTSTRAP_FRESH_CHECK = int(os.getenv("MONITOR_BOOTSTRAP_FRESH_CHECK", "
 
 LEGACY_CHANNELS_FILE = os.getenv("MONITOR_CHANNELS_FILE", "channels.json")
 
+# Обычный Bot API (MONITOR_BOT_TOKEN) не может отправлять файлы больше 2 ГБ —
+# это ограничение Telegram, не наше. Чтобы публиковать ролики больше, нужен
+# второй контур — личный аккаунт (юзербот), как и в основном bot.py, но
+# отдельная сессия: channel_monitor.py — отдельный процесс, и одновременно
+# открывать тот же user_session.session, что и bot.py, нельзя (SQLite-сессия
+# не любит два процесса сразу — файл может повредиться).
+_monitor_userbot_env = os.getenv("MONITOR_USE_USERBOT", "")
+MONITOR_USE_USERBOT = (_monitor_userbot_env.lower() == "true") if _monitor_userbot_env else core.USE_USERBOT
+MONITOR_USER_SESSION = os.getenv("MONITOR_USER_SESSION", "monitor_user_session")
+BOT_API_FILE_LIMIT_MB = 1990  # чуть меньше жёсткого лимита Telegram в 2048 МБ, с запасом
+
+# Сколько раз подряд пробовать опубликовать один и тот же ролик, прежде чем
+# сдаться и пометить его как "обработанный" (чтобы не долбиться в одну и ту
+# же стену бесконечно, если ролик опубликован вручную или падает по другой
+# неустранимой причине).
+MAX_RETRY_ATTEMPTS = int(os.getenv("MONITOR_MAX_RETRY", "2"))
+
 if not MONITOR_BOT_TOKEN:
     core.term_log("⛔ CRITICAL", "MONITOR_BOT_TOKEN не задан в .env", core.Colors.RED)
     sys.exit(1)
@@ -45,6 +62,39 @@ if not MONITOR_BOT_TOKEN:
 pending: dict = {}
 check_lock = asyncio.Lock()
 videos_in_progress: set = set()
+user_client: Optional[TelegramClient] = None  # подключается в main(), если MONITOR_USE_USERBOT
+
+# ─────────────────────────────────────────────
+# СЧЁТЧИК НЕУДАЧНЫХ ПОПЫТОК (чтобы не долбить один и тот же ролик вечно)
+# ─────────────────────────────────────────────
+def _init_failure_table():
+    core.db.c.execute("""
+        CREATE TABLE IF NOT EXISTS monitor_failures (
+            video_id TEXT PRIMARY KEY,
+            attempts INTEGER DEFAULT 0,
+            last_error TEXT,
+            last_attempt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    core.db.conn.commit()
+
+def get_failure_count(video_id: str) -> int:
+    core.db.c.execute("SELECT attempts FROM monitor_failures WHERE video_id=?", (video_id,))
+    row = core.db.c.fetchone()
+    return row[0] if row else 0
+
+def record_failure(video_id: str, error) -> int:
+    core.db.c.execute(
+        "INSERT INTO monitor_failures (video_id, attempts, last_error, last_attempt) VALUES (?,1,?,CURRENT_TIMESTAMP) "
+        "ON CONFLICT(video_id) DO UPDATE SET attempts=attempts+1, last_error=excluded.last_error, last_attempt=CURRENT_TIMESTAMP",
+        (video_id, str(error)[:500])
+    )
+    core.db.conn.commit()
+    return get_failure_count(video_id)
+
+def clear_failure(video_id: str):
+    core.db.c.execute("DELETE FROM monitor_failures WHERE video_id=?", (video_id,))
+    core.db.conn.commit()
 
 # ─────────────────────────────────────────────
 # БАЗА ИГР И ЖАНРОВ
@@ -391,6 +441,29 @@ async def post_video(client: TelegramClient, channel: dict, video: dict):
     if vid in videos_in_progress:
         core.term_log("⏭️ MONITOR", f"[{name}] {vid} уже качается — пропуск дубля", core.Colors.YELLOW)
         return
+
+    fail_count = get_failure_count(vid)
+    if fail_count >= MAX_RETRY_ATTEMPTS:
+        core.term_log(
+            "🏳️ MONITOR",
+            f"[{name}] «{title}» ({vid}) уже падал {fail_count} раз подряд — сдаюсь, "
+            f"считаю обработанным (вручную или навсегда недоступно)",
+            core.Colors.YELLOW
+        )
+        core.db.monitor_mark_posted(vid, name, title)
+        clear_failure(vid)
+        try:
+            await client.send_message(
+                core.OWNER_ID,
+                f"⚠️ Не смог автоматически опубликовать «{title}» ({vid}) из канала «{name}» "
+                f"после {fail_count} попыток подряд. Пометил как обработанное, больше качать не буду. "
+                f"Если видео ещё нет на канале — выложи вручную.\n\n"
+                f"Причина последней ошибки: см. лог."
+            )
+        except Exception:
+            pass
+        return
+
     videos_in_progress.add(vid)
 
     try:
@@ -440,15 +513,38 @@ async def post_video(client: TelegramClient, channel: dict, video: dict):
         #
         # 🎮 #Игра 👻 #Хоррор (если есть)
         # 👤 #Автор
+        # 🔗 youtu.be/ID — обычным текстом, не кнопкой (кнопка ломает "Комментарии"
+        # у канала), но по этой ссылке бот умеет узнавать уже выложенные видео
+        # при сканировании истории канала — см. sync_posted_from_channel().
         caption_lines = [f"🎬 **{title}**\n"]
         if tags_list:
             caption_lines.append(" ".join(tags_list))
         caption_lines.append(f"👤 {author_tag}")
+        caption_lines.append(f"🔗 youtu.be/{vid}")
 
         caption = "\n".join(caption_lines)
 
+        # Обычный бот-токен не может отправить файл больше ~2 ГБ — это лимит
+        # Telegram Bot API. Если файл больше и юзербот подключен — шлём через
+        # него (личный аккаунт должен быть добавлен в целевой(ые) канал(ы)).
+        file_size_mb = os.path.getsize(path) / (1024 * 1024)
+        send_client = client
+        if file_size_mb > BOT_API_FILE_LIMIT_MB:
+            if user_client:
+                send_client = user_client
+                core.term_log(
+                    "💎 MONITOR",
+                    f"[{name}] Файл {file_size_mb:.0f} МБ > лимита Bot API ({BOT_API_FILE_LIMIT_MB} МБ) — отправляю через юзербота",
+                    core.Colors.CYAN
+                )
+            else:
+                raise ValueError(
+                    f"файл {file_size_mb:.0f} МБ превышает лимит обычного Bot API ({BOT_API_FILE_LIMIT_MB} МБ), "
+                    f"а юзербот не подключен — включи MONITOR_USE_USERBOT=true в .env и перезапусти"
+                )
+
         for target in targets:
-            await client.send_file(
+            await send_client.send_file(
                 target,
                 path,
                 caption=caption,
@@ -457,10 +553,16 @@ async def post_video(client: TelegramClient, channel: dict, video: dict):
             )
 
         core.db.monitor_mark_posted(vid, name, title)
+        clear_failure(vid)
         core.term_log("✅ MONITOR", f"[{name}] Опубликовано: {title}", core.Colors.GREEN)
 
     except Exception as e:
-        core.term_log("❌ MONITOR", f"[{name}] Ошибка публикации {vid}: {e}", core.Colors.RED)
+        attempts = record_failure(vid, e)
+        core.term_log(
+            "❌ MONITOR",
+            f"[{name}] Ошибка публикации {vid} (попытка {attempts}/{MAX_RETRY_ATTEMPTS}): {e}",
+            core.Colors.RED
+        )
     finally:
         videos_in_progress.discard(vid)
         for fname in os.listdir(core.DOWNLOAD_DIR):
@@ -469,6 +571,72 @@ async def post_video(client: TelegramClient, channel: dict, video: dict):
                     os.remove(os.path.join(core.DOWNLOAD_DIR, fname))
                 except Exception:
                     pass
+
+# ─────────────────────────────────────────────
+# СКАНИРОВАНИЕ КАНАЛА (чтобы не дублировать видео, выложенные вручную)
+# ─────────────────────────────────────────────
+YT_ID_IN_TEXT_RE = re.compile(
+    r'(?:youtu\.be/|youtube\.com/(?:watch\?v=|shorts/|embed/))([A-Za-z0-9_-]{11})'
+)
+
+def extract_video_ids_from_text(text: str) -> list:
+    if not text:
+        return []
+    return YT_ID_IN_TEXT_RE.findall(text)
+
+async def sync_posted_from_channel(channel_identifier: str, limit: int = 500) -> int:
+    """Проходит по истории Telegram-канала и помечает в базе как 'уже
+    опубликовано' все video_id, которые находит в подписях (через ссылку
+    youtu.be/ID) — не важно, бот их туда положил или ты сам руками. Так
+    при следующей проверке бот не станет перекачивать то, что уже на канале.
+
+    ВАЖНО: читать историю канала (GetHistoryRequest) умеет только обычный
+    пользовательский аккаунт — Telegram жёстко запрещает это для bot-токенов,
+    это не обходится настройками. Поэтому здесь используется юзербот
+    (user_client), а не обычный бот (MONITOR_BOT_TOKEN)."""
+    if not user_client:
+        return -1  # сигнал "не сканировали вообще", отличаем от "нашли 0"
+    found = 0
+    try:
+        async for msg in user_client.iter_messages(channel_identifier, limit=limit):
+            text = msg.text or msg.message or ""
+            for vid in extract_video_ids_from_text(text):
+                if not core.db.monitor_is_posted(vid):
+                    core.db.monitor_mark_posted(vid, "synced_from_channel", "")
+                    found += 1
+    except Exception as e:
+        core.term_log("⚠️ MONITOR", f"Не удалось просканировать канал {channel_identifier}: {e}", core.Colors.YELLOW)
+    return found
+
+async def sync_all_target_channels(limit: int = 500):
+    """Собирает все реально используемые Telegram-каналы (из всех настроенных
+    YouTube-каналов плюс канал по умолчанию) и сканирует каждый по одному разу.
+    Требует подключённого юзербота (MONITOR_USE_USERBOT=true) — без него
+    сканирование истории канала невозможно в принципе (ограничение Telegram)."""
+    if not user_client:
+        core.term_log(
+            "⚠️ MONITOR",
+            "Сканирование истории канала требует юзербота (MONITOR_USE_USERBOT=true в .env) — "
+            "боты не умеют читать историю канала, это ограничение самого Telegram. Пропускаю.",
+            core.Colors.YELLOW
+        )
+        return 0
+
+    targets = {TARGET_CHANNEL}
+    for ch in core.db.monitor_list_channels():
+        raw = ch.get("target_channel") or ""
+        for t in raw.split(","):
+            t = t.strip()
+            if t:
+                targets.add(t)
+
+    total = 0
+    for t in targets:
+        n = await sync_posted_from_channel(t, limit=limit)
+        if n > 0:
+            core.term_log("🔄 MONITOR", f"Канал {t}: найдено и учтено {n} уже выложенных видео", core.Colors.CYAN)
+        total += max(n, 0)
+    return total
 
 # ─────────────────────────────────────────────
 # ПРОВЕРКА КАНАЛОВ
@@ -626,6 +794,14 @@ def register_handlers(client: TelegramClient):
         ok = core.db.monitor_forget(vid)
         await event.respond(f"✅ Забыл `{vid}`, теперь он снова новый." if ok else f"⚠️ `{vid}` не найден.")
 
+    @client.on(events.NewMessage(pattern=r"^/sync(\s|$)"))
+    async def cmd_sync(event):
+        if not is_owner(event):
+            return
+        await event.respond("🔄 Сканирую каналы на уже выложенные видео (в т.ч. то, что ты запостил вручную)...")
+        n = await sync_all_target_channels()
+        await event.respond(f"✅ Готово. Учтено видео: {n}." if n else "✅ Готово. Новых уже выложенных видео не найдено.")
+
     @client.on(events.NewMessage())
     async def on_any_message(event):
         if not is_owner(event):
@@ -782,6 +958,10 @@ def register_handlers(client: TelegramClient):
 # СТАРТ
 # ─────────────────────────────────────────────
 async def main():
+    global user_client
+
+    _init_failure_table()
+
     client = TelegramClient(
         "monitor_session",
         core.API_ID,
@@ -790,7 +970,34 @@ async def main():
     )
     await client.start(bot_token=MONITOR_BOT_TOKEN)
 
+    if MONITOR_USE_USERBOT:
+        try:
+            user_client = TelegramClient(
+                MONITOR_USER_SESSION,
+                core.API_ID,
+                core.API_HASH,
+                proxy=core.get_telethon_proxy(),
+            )
+            # Если сессии ещё нет — Telethon запросит номер телефона и код
+            # прямо в консоли при первом запуске (это нормально, один раз).
+            await user_client.start()
+            me_u = await user_client.get_me()
+            core.term_log(
+                "💎 MONITOR",
+                f"Юзербот для файлов >{BOT_API_FILE_LIMIT_MB}МБ подключен: {me_u.first_name} "
+                f"(убедись, что этот аккаунт добавлен в целевые каналы!)",
+                core.Colors.GREEN
+            )
+        except Exception as e:
+            core.term_log("⚠️ MONITOR", f"Не удалось подключить юзербота для больших файлов: {e}", core.Colors.YELLOW)
+            user_client = None
+
     migrate_legacy_channels_json()
+
+    core.term_log("🔄 MONITOR", "Сканирую целевые каналы на уже выложенные видео...", core.Colors.CYAN)
+    synced = await sync_all_target_channels()
+    if synced:
+        core.term_log("🔄 MONITOR", f"Итого учтено {synced} уже выложенных видео (не будут дублироваться)", core.Colors.GREEN)
 
     me = await client.get_me()
     n = len(core.db.monitor_list_channels())
